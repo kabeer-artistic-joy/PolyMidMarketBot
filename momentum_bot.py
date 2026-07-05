@@ -20,10 +20,8 @@ IMPORTANT — read before running live:
   This asks for something genuinely harder to predict than the other bots in
   this project: not just direction, but direction AND magnitude AND timing,
   continuously re-evaluated throughout the window. This has NOT been
-  validated with real data. "Enters most windows" is a real, explicit design
-  goal here, but the signal must still clear its bar — this bot will NOT
-  force an entry with no real momentum behind it just to hit a trade count.
-  Run --dry-run for a meaningful sample before ever using --live.
+  validated with real data. Run --dry-run for a meaningful sample before
+  ever using --live.
 
 Modes:
   --dry-run   No real orders. Polls the REAL, LIVE order book and computes
@@ -60,6 +58,9 @@ MARKETS = {
 SIGNAL_LOOKBACK_SEC   = 15    # how far back to look for recent momentum
 MIN_MOVE_TO_TRUST     = 0.03  # minimum real move (in price, not %) over the lookback before trusting direction —
                                 # a starting hypothesis, not a calibrated number. Prevents acting on pure noise.
+MAX_MOVE_TO_TRUST     = 0.15  # upper bound, calibrated from real data: the largest real winning move observed
+                                # was 0.13; the one known large-move loss was 0.20. A move beyond this ceiling
+                                # is treated as possibly overextended/exhausted rather than more trustworthy.
 CLEANLINESS_MIN_RATIO = 0.5   # same concept as the predict-variant bot: net move vs total high-low range over
                                 # the lookback. A low ratio means whipsaw, not a real trend — same logic that
                                 # helped catch the delta bot's biggest-signal loss.
@@ -74,9 +75,7 @@ BUY_TIMEOUT_SEC     = 3.0
 MAX_TRADES_PER_WINDOW = 2
 
 MONITOR_INTERVAL = 2.0   # how often to check for a new entry opportunity throughout the window
-# Force-exit removed entirely per explicit request — unsold positions now ride
-# to actual market resolution instead of being sold early at a fixed cutoff.
-# This means an unsold trade can win fully or lose fully, not a bounded loss.
+FORCE_EXIT_SECONDS_LEFT = 5  # exit at any price if still holding with this little time left in the window
 
 POLL_INTERVAL_SLOW = 1.0
 
@@ -221,6 +220,9 @@ class PriceHistory:
         if abs(move) < MIN_MOVE_TO_TRUST:
             result["reason"] = f"move {move:+.4f} < {MIN_MOVE_TO_TRUST} — too weak to trust"
             return result
+        if abs(move) > MAX_MOVE_TO_TRUST:
+            result["reason"] = f"move {move:+.4f} > {MAX_MOVE_TO_TRUST} — possibly overextended, treating as unreliable"
+            return result
         if cleanliness < CLEANLINESS_MIN_RATIO:
             result["reason"] = f"move {move:+.4f} OK, but cleanliness {cleanliness:.2f} < {CLEANLINESS_MIN_RATIO} — too much whipsaw"
             return result
@@ -273,8 +275,8 @@ class MomentumBot:
 
         log("=" * 70)
         log(f"Momentum Scalper | {self.mode_str.upper()} | ${amount:.2f}/trade | bot_name={self.bot_name}")
-        log(f"Signal: {SIGNAL_LOOKBACK_SEC}s lookback, min move {MIN_MOVE_TO_TRUST}, cleanliness >= {CLEANLINESS_MIN_RATIO}")
-        log(f"Sell trigger: entry + ${PROFIT_MARGIN} | unsold positions hold to actual resolution (no force-exit) | max {MAX_TRADES_PER_WINDOW} trades/window")
+        log(f"Signal: {SIGNAL_LOOKBACK_SEC}s lookback, min move {MIN_MOVE_TO_TRUST}, max move {MAX_MOVE_TO_TRUST}, cleanliness >= {CLEANLINESS_MIN_RATIO}")
+        log(f"Sell trigger: entry + ${PROFIT_MARGIN} | force-exit last {FORCE_EXIT_SECONDS_LEFT}s | max {MAX_TRADES_PER_WINDOW} trades/window")
         log(f"Trade log: {self.logger.path}")
         log("=" * 70)
 
@@ -374,10 +376,6 @@ class MomentumBot:
         if shares != raw_shares:
             log(f"⚠️ Buy partially filled: held {raw_shares}, flooring to {shares} whole shares to keep sells valid", crypto)
         if shares < 1:
-            # NOTE: this specific case is NOT a premature time-based exit — a
-            # sub-1-share dust fill can never be sold as a normal limit order
-            # regardless of how much time is given, so exiting it immediately
-            # is the only option, not the thing that was removed below.
             log("⚠️ Partial fill left less than 1 whole share — forcing immediate exit", crypto)
             exit_result = self._force_exit(token, raw_shares, crypto)
             pnl = -round(buy_price * raw_shares, 4)
@@ -405,22 +403,13 @@ class MomentumBot:
                 sell_order_id = resp.get("orderID", "")
                 log(f"Resting SELL placed at ${sell_trigger}, order {sell_order_id[:16]}...", crypto)
             except Exception as e:
-                # Order placement itself failing is a real error to recover
-                # from, not the time-based premature exit that was removed —
-                # keeping a fallback here is a different thing than force-exit.
-                log(f"⚠️ Could not place resting sell ({e}) — exiting immediately since we can't rest a sell at all", crypto)
+                log(f"⚠️ Could not place resting sell ({e}) — forcing exit immediately", crypto)
                 exit_result = self._force_exit(token, shares, crypto)
                 pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
                 return {**exit_result, "pnl_usd": pnl, "notes": "resting sell placement failed"}
 
-            # No more time-based force-exit. Keep watching until either the
-            # resting order fully fills, or the window actually closes — at
-            # which point the position rides to real market resolution
-            # instead of being sold early. This means the true outcome of an
-            # unsold position is NOT known immediately anymore; it depends
-            # on the actual settlement, which this bot does not yet check.
             last_known_sold = 0.0
-            while now_unix() < close_ts:
+            while close_ts - now_unix() > FORCE_EXIT_SECONDS_LEFT:
                 try:
                     detail = self.client.get_order(sell_order_id)
                 except Exception:
@@ -440,25 +429,21 @@ class MomentumBot:
                 pnl = round((sell_trigger - buy_price) * shares, 4)
                 return {"result": "sold", "price": sell_trigger, "pnl_usd": pnl, "notes": "sold via resting order"}
 
-            remaining = round(shares - last_known_sold, 4)
-            # Cancel the now-stale resting sell BEFORE holding to resolution —
-            # otherwise it could still get matched at the old, low sell_trigger
-            # price right as the market resolves, accidentally giving away the
-            # exact upside this decision was meant to hold for. We keep the
-            # underlying shares; we just remove the order offering to sell them cheap.
             try:
                 self.client.cancel_order(OrderPayload(orderID=sell_order_id))
             except Exception:
-                pass  # may already be gone if it just fully filled in the final instant — fine
-            log(f"⏰ Window closed with {remaining} shares unsold — cancelled the resting sell, holding to actual "
-                f"market resolution, true outcome not yet known", crypto)
-            sold_pnl = round((sell_trigger - buy_price) * last_known_sold, 4) if last_known_sold > 0 else 0.0
-            return {"result": "holding_to_resolution", "price": None, "pnl_usd": sold_pnl,
-                    "notes": f"{remaining} shares still unsold at window close — pnl on those is pending actual resolution, not reflected above"}
+                pass
+            remaining = round(shares - last_known_sold, 4)
+            if remaining < 1:
+                pnl = round((sell_trigger - buy_price) * last_known_sold, 4)
+                return {"result": "sold", "price": sell_trigger, "pnl_usd": pnl, "notes": "dust remainder left"}
+            exit_result = self._force_exit(token, int(remaining), crypto)
+            sold_pnl = round((sell_trigger - buy_price) * last_known_sold, 4)
+            exit_pnl = round((exit_result["price"] - buy_price) * int(remaining), 4) if exit_result["price"] is not None else -round(buy_price * int(remaining), 4)
+            return {**exit_result, "pnl_usd": round(sold_pnl + exit_pnl, 4), "notes": "partial via resting order + force-exit"}
 
-        # DRY-RUN: poll-based simulation. Same change — keep watching until
-        # sold or the window closes, no simulated forced exit.
-        while now_unix() < close_ts:
+        # DRY-RUN: poll-based simulation
+        while close_ts - now_unix() > FORCE_EXIT_SECONDS_LEFT:
             book = get_order_book(token)
             price, size = best_bid(book)
             if price is not None and price >= sell_trigger and size >= shares:
@@ -467,9 +452,10 @@ class MomentumBot:
                 return {"result": "sold", "price": price, "pnl_usd": pnl, "notes": "sold"}
             time.sleep(POLL_INTERVAL_SLOW)
 
-        log(f"⏰ Window closed, still holding — this would ride to actual resolution (not simulated here)", crypto)
-        return {"result": "holding_to_resolution", "price": None, "pnl_usd": 0.0,
-                "notes": "never reached sell trigger before window close — true outcome not simulated"}
+        log(f"⏰ Force-exit window reached ({FORCE_EXIT_SECONDS_LEFT}s left), still holding — exiting at best price", crypto)
+        exit_result = self._force_exit(token, shares, crypto)
+        pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
+        return {**exit_result, "pnl_usd": pnl, "notes": "force-exit"}
 
     def _force_exit(self, token: str, shares: float, crypto: str) -> dict:
         if self.dry_run:
@@ -478,6 +464,7 @@ class MomentumBot:
             if price is None:
                 log("[DRY] No bids at all for force-exit — total loss this trade", crypto)
                 return {"result": "no_bids", "price": None}
+            log(f"[DRY] Force-exit would fill at ${price:.3f}", crypto)
             return {"result": "exited", "price": price}
 
         from py_clob_client_v2 import MarketOrderArgsV2, Side, OrderType
@@ -534,9 +521,6 @@ class MomentumBot:
             up_signal   = up_history.signal()
             down_signal = down_history.signal()
 
-            # Only one side can genuinely be trending at a time in a two-outcome
-            # market (they're complementary) — but check both independently
-            # since our own price histories could briefly disagree due to timing.
             chosen = None
             if up_signal["side"] == "Up":
                 chosen = ("Up", market["up_token"], up_price, up_signal)
@@ -608,22 +592,58 @@ class MomentumBot:
             self._print_summary()
 
     def _print_summary(self):
-        log("-" * 70)
         with self.trades_lock:
             trades = list(self.trades)
-        bought  = [t for t in trades if t["buy_result"] == "bought"]
-        sold    = [t for t in bought if t["sell_result"] == "sold"]
-        pending = [t for t in bought if t["sell_result"] == "holding_to_resolution"]
-        dust    = [t for t in bought if t["sell_result"] not in ("sold", "holding_to_resolution")]
-        total_pnl = sum(float(t["pnl_usd"] or 0) for t in trades)
-        log(f"SUMMARY — {len(trades)} signals fired, {len(bought)} buy fills")
-        log(f"  Sold at margin: {len(sold)}")
-        log(f"  Holding to actual resolution (outcome not yet known): {len(pending)}")
-        if dust:
-            log(f"  Other (dust/error handling): {len(dust)}")
-        log(f"  Total PnL shown here EXCLUDES pending positions — check your actual account for their real outcome")
-        log(f"  Realized PnL so far: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
-        log("-" * 70)
+
+        closed = [t for t in trades
+                  if t["buy_result"] == "bought" and t["sell_result"] in ("sold", "exited", "no_bids", "unmatched")]
+
+        with _print_lock:
+            print()
+            header = f"| {'#':<2} | {'Time':<8} | {'Side':<4} | {'Buy':<5} | {'Sell':<14} | {'PnL':<6} |"
+            border = "+" + "-"*4 + "+" + "-"*10 + "+" + "-"*6 + "+" + "-"*7 + "+" + "-"*16 + "+" + "-"*8 + "+"
+            print(border)
+            print(header)
+            print(border)
+            for i, t in enumerate(closed, 1):
+                time_str = t["timestamp"][11:19] if len(t["timestamp"]) >= 19 else t["timestamp"]
+                side = t["signal_side"] or "?"
+                buy_price = f"{t['buy_price']:.2f}" if t["buy_price"] is not None else "?"
+                if t["sell_result"] == "sold":
+                    sell_str = f"{t['sell_price']:.2f}"
+                else:
+                    sell_str = f"{t['sell_price']:.2f} (forced)" if t["sell_price"] is not None else "no bids (forced)"
+                pnl = t["pnl_usd"]
+                pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:.2f}"
+                print(f"| {i:<2} | {time_str:<8} | {side:<4} | {buy_price:<5} | {sell_str:<14} | {pnl_str:<6} |")
+            print(border)
+
+            wins   = [t for t in closed if t["pnl_usd"] >= 0]
+            losses = [t for t in closed if t["pnl_usd"] < 0]
+            total_pnl = sum(t["pnl_usd"] for t in closed)
+            closed_capital = len(closed) * self.amount
+            return_pct = (total_pnl / closed_capital * 100) if closed_capital > 0 else 0.0
+            win_rate = (len(wins) / len(closed) * 100) if closed else 0.0
+
+            print()
+            print("Summary")
+            print("-------")
+            print(f"Total Realized P&L           : {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
+            print(f"Closed Capital                : ${closed_capital:.2f}")
+            print(f"Return on Closed Capital       : {return_pct:.1f}%")
+            print(f"Closed Trades                 : {len(closed)}")
+            print(f"Wins                           : {len(wins)}")
+            print(f"Losses                         : {len(losses)}")
+            print(f"Win Rate                       : {win_rate:.1f}%")
+
+            if losses:
+                print()
+                print("Loss Trade(s):")
+                for t in losses:
+                    time_str = t["timestamp"][11:19] if len(t["timestamp"]) >= 19 else t["timestamp"]
+                    sell_str = f"{t['sell_price']:.2f}" if t["sell_price"] is not None else "no bids"
+                    print(f"- {time_str} | {t['signal_side']} | Bought: {t['buy_price']:.2f} -> Forced Exit: {sell_str} | P&L: ${t['pnl_usd']:.2f}")
+            print(flush=True)
 
 
 if __name__ == "__main__":
