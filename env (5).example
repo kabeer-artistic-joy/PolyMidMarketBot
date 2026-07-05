@@ -1,0 +1,9 @@
+# Environment variables — copy this file to .env and fill in your values
+# Never commit the real .env file to version control
+
+BOT_NAME=momentum_bot1
+
+# Required for --live mode only
+POLY_PRIVATE_KEY=your_polygon_private_key_here
+POLY_PROXY_WALLET=your_polymarket_proxy_wallet_address_here
+POLY_SIGNATURE_TYPE=3
