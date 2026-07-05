@@ -52,8 +52,6 @@ load_dotenv()
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
-BINANCE_API = "https://api.binance.com"
-SYMBOLS = {"BTC": "BTCUSDT"}
 
 MARKETS = {
     "btc-updown-5m": "BTC",   # BTC only, per explicit request — extend later once validated
@@ -62,10 +60,6 @@ MARKETS = {
 SIGNAL_LOOKBACK_SEC   = 15    # how far back to look for recent momentum
 MIN_MOVE_TO_TRUST     = 0.03  # minimum real move (in price, not %) over the lookback before trusting direction —
                                 # a starting hypothesis, not a calibrated number. Prevents acting on pure noise.
-MAX_MOVE_TO_TRUST     = 0.15  # NEW — upper bound, calibrated directly from real data: the largest real winning
-                                # move observed was 0.13; the one large-move loss was 0.20. A move beyond this
-                                # ceiling is treated as possibly overextended/exhausted rather than more trustworthy.
-                                # Still a small-sample calibration (n=11 wins, 1 loss) — not a settled number.
 CLEANLINESS_MIN_RATIO = 0.5   # same concept as the predict-variant bot: net move vs total high-low range over
                                 # the lookback. A low ratio means whipsaw, not a real trend — same logic that
                                 # helped catch the delta bot's biggest-signal loss.
@@ -100,44 +94,6 @@ def log(msg, crypto=""):
 
 def now_unix():
     return time.time()
-
-
-def get_resolved_outcome(slug: str) -> str | None:
-    """
-    Re-fetches a market AFTER its window has closed, to find the REAL final
-    winning outcome (settlement is always exactly $1 or $0 — never partial).
-    Returns the winning outcome name, or None if not resolved yet.
-    """
-    try:
-        r = requests.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=3)
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return None
-        event = data[0]
-    except Exception:
-        return None
-
-    if not event.get("closed"):
-        return None
-
-    markets = event.get("markets", [])
-    if not markets:
-        return None
-    market = markets[0]
-
-    try:
-        outcome_prices = json.loads(market.get("outcomePrices", "[]"))
-        outcomes       = json.loads(market.get("outcomes", "[]"))
-    except Exception:
-        return None
-
-    if len(outcome_prices) < 2:
-        return None
-
-    prices = [float(p) for p in outcome_prices]
-    winner_idx = 0 if prices[0] >= prices[1] else 1
-    return outcomes[winner_idx]
 
 
 def get_window_market(slug_prefix: str, start_ts: int) -> dict | None:
@@ -218,48 +174,6 @@ def mid_price(book: dict) -> float | None:
     return round((bid + ask) / 2, 4)
 
 
-def get_binance_price(symbol: str) -> float | None:
-    """Current price of the real underlying asset — used as an independent
-    check against Polymarket's own (sometimes noisy/lagging) derived price."""
-    try:
-        r = requests.get(f"{BINANCE_API}/api/v3/ticker/price", params={"symbol": symbol}, timeout=2)
-        r.raise_for_status()
-        return float(r.json()["price"])
-    except Exception:
-        return None
-
-
-class BinanceHistory:
-    """
-    Tracks the REAL underlying asset's price over the same lookback window
-    as PriceHistory, to independently confirm Polymarket's own signal isn't
-    just local noise/lag in Polymarket's derived price. A real move should
-    show up in both; a move that shows up ONLY in Polymarket's own price and
-    not in the real underlying asset is exactly the failure mode that caused
-    one of the two known losses this bot has had.
-    """
-    def __init__(self, lookback_sec: float):
-        self.lookback_sec = lookback_sec
-        self.buffer = collections.deque()
-
-    def add(self, price: float):
-        now = now_unix()
-        self.buffer.append((now, price))
-        cutoff = now - self.lookback_sec
-        while self.buffer and self.buffer[0][0] < cutoff:
-            self.buffer.popleft()
-
-    def direction(self) -> str | None:
-        """Returns 'Up', 'Down', or None if there's not enough data or the move is flat."""
-        if len(self.buffer) < 3:
-            return None
-        prices = [p for _, p in self.buffer]
-        move = prices[-1] - prices[0]
-        if move == 0:
-            return None
-        return "Up" if move > 0 else "Down"
-
-
 def next_window_start(now: float) -> int:
     return int((now // 300) + 1) * 300
 
@@ -307,9 +221,6 @@ class PriceHistory:
         if abs(move) < MIN_MOVE_TO_TRUST:
             result["reason"] = f"move {move:+.4f} < {MIN_MOVE_TO_TRUST} — too weak to trust"
             return result
-        if abs(move) > MAX_MOVE_TO_TRUST:
-            result["reason"] = f"move {move:+.4f} > {MAX_MOVE_TO_TRUST} — possibly overextended, treating as unreliable"
-            return result
         if cleanliness < CLEANLINESS_MIN_RATIO:
             result["reason"] = f"move {move:+.4f} OK, but cleanliness {cleanliness:.2f} < {CLEANLINESS_MIN_RATIO} — too much whipsaw"
             return result
@@ -323,7 +234,7 @@ class PriceHistory:
 
 CSV_FIELDS = [
     "timestamp", "bot_name", "mode", "crypto", "slug", "trade_num_this_window",
-    "signal_side", "signal_move", "signal_cleanliness", "signal_reason", "binance_agrees",
+    "signal_side", "signal_move", "signal_cleanliness", "signal_reason",
     "buy_result", "buy_price", "buy_shares", "buy_elapsed_ms",
     "sell_result", "sell_price", "pnl_usd", "notes",
 ]
@@ -353,10 +264,6 @@ class MomentumBot:
         self.mode_str = "dry_run" if dry_run else "live"
         self.stop_event = threading.Event()
         self.trades = []
-        self.wins = 0
-        self.losses = 0
-        self.pending = 0
-        self.realized_pnl = 0.0
         self.trades_lock = threading.Lock()
         self.logger = TradeLogger(self.bot_name)
 
@@ -598,12 +505,6 @@ class MomentumBot:
         crypto = MARKETS[slug_prefix]
         close_ts = start_ts + 300
 
-        with _print_lock:
-            print("\n" + "=" * 70)
-            print(f"WINDOW  {datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime('%H:%M:%S')} - "
-                  f"{datetime.fromtimestamp(close_ts, tz=timezone.utc).strftime('%H:%M:%S')} UTC")
-            print("=" * 70, flush=True)
-
         market = None
         find_deadline = now_unix() + 5
         while now_unix() < find_deadline:
@@ -615,10 +516,8 @@ class MomentumBot:
             log(f"Could not find market for window starting {start_ts} — skipping entire window", crypto)
             return
 
-        up_history      = PriceHistory(SIGNAL_LOOKBACK_SEC)
-        down_history    = PriceHistory(SIGNAL_LOOKBACK_SEC)
-        binance_history = BinanceHistory(SIGNAL_LOOKBACK_SEC)
-        symbol = SYMBOLS.get(crypto)
+        up_history   = PriceHistory(SIGNAL_LOOKBACK_SEC)
+        down_history = PriceHistory(SIGNAL_LOOKBACK_SEC)
         trades_this_window = 0
 
         while now_unix() < close_ts and trades_this_window < MAX_TRADES_PER_WINDOW:
@@ -631,10 +530,6 @@ class MomentumBot:
                 up_history.add(up_price)
             if down_price is not None:
                 down_history.add(down_price)
-            if symbol:
-                real_price = get_binance_price(symbol)
-                if real_price is not None:
-                    binance_history.add(real_price)
 
             up_signal   = up_history.signal()
             down_signal = down_history.signal()
@@ -648,26 +543,6 @@ class MomentumBot:
             elif down_signal["side"] == "Down":
                 chosen = ("Down", market["down_token"], down_price, down_signal)
 
-            # SHADOW-MODE ONLY: computed and logged on every signal, but never
-            # blocks an entry. Its one supporting example (a past trade this
-            # would have blocked) turned out to be a real win, not the loss
-            # it was built around — so this stays observation-only until
-            # there's enough real evidence to know if it's net helpful.
-            binance_agrees = None
-            if chosen:
-                side = chosen[0]
-                real_direction = binance_history.direction()
-                if real_direction is None:
-                    binance_agrees = "no_data"
-                    log(f"[SHADOW] Signal on {side}, Binance: not enough data yet to compare (not blocking)", crypto)
-                elif real_direction == side:
-                    binance_agrees = "agree"
-                    log(f"[SHADOW] Signal on {side}, Binance agrees ({real_direction}) — logged only", crypto)
-                else:
-                    binance_agrees = "disagree"
-                    log(f"[SHADOW] Signal on {side}, but Binance shows {real_direction} — DISAGREEMENT, "
-                        f"logged only, NOT blocking this entry", crypto)
-
             if chosen:
                 side, token, price, signal = chosen
                 trades_this_window += 1
@@ -678,8 +553,7 @@ class MomentumBot:
                     "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str,
                     "crypto": crypto, "slug": market["slug"], "trade_num_this_window": trades_this_window,
                     "signal_side": side, "signal_move": signal["move"], "signal_cleanliness": signal["cleanliness"],
-                    "signal_reason": signal["reason"], "binance_agrees": binance_agrees,
-                    "buy_result": buy_info["result"],
+                    "signal_reason": signal["reason"], "buy_result": buy_info["result"],
                     "buy_price": buy_info["price"], "buy_shares": buy_info["shares"],
                 }
 
@@ -697,106 +571,14 @@ class MomentumBot:
 
             time.sleep(MONITOR_INTERVAL)
 
-    def _print_trade_box(self, trade_num: int, row: dict):
-        """Prints a clear, bordered summary for one trade the moment it has
-        a real result (sold, missed, or pending resolution)."""
-        side  = row["signal_side"]
-        entry = row["buy_price"]
-        with _print_lock:
-            print(f"\n  TRADE #{trade_num} " + "-" * 38)
-            print(f"  Side:      {side.upper() if side else '?'}")
-            if row["buy_result"] != "bought":
-                print(f"  Result:    BUY MISSED (no fill)")
-                print(f"  P&L:       $0 (no position taken)")
-            elif row["sell_result"] == "sold":
-                print(f"  Entry:     ${entry}")
-                print(f"  Sold:      ${row['sell_price']}")
-                print(f"  Result:    WON")
-                print(f"  P&L:       +${row['pnl_usd']:.2f}")
-            elif row["sell_result"] == "holding_to_resolution":
-                print(f"  Entry:     ${entry}")
-                print(f"  Result:    STILL HOLDING (real outcome not known yet)")
-                print(f"  P&L:       PENDING")
-            else:
-                print(f"  Entry:     ${entry}")
-                print(f"  Result:    {row['sell_result']}")
-                print(f"  P&L:       {row['pnl_usd']:+.2f}")
-            print("  " + "-" * 48)
-            print(flush=True)
-
-    def _print_session_tally(self):
-        with self.trades_lock:
-            wins, losses, pending, realized = self.wins, self.losses, self.pending, self.realized_pnl
-        with _print_lock:
-            print("=" * 70)
-            print(f"SESSION SO FAR: {wins + losses} closed ({wins} won, {losses} lost) | {pending} still holding")
-            print(f"Realized P&L: {'+' if realized >= 0 else ''}${realized:.2f} | Pending (unknown): {pending}")
-            print("=" * 70, flush=True)
-
-    def _resolve_pending(self, slug: str, crypto: str, side: str, buy_price: float, shares: float):
-        """
-        Runs in the background for a position that's still holding when its
-        window closes. Waits for the market to actually resolve, checks the
-        REAL outcome, and prints/logs the true result once known — instead
-        of leaving it as an unknown 'pending' forever.
-        """
-        def worker():
-            actual_winner = None
-            for _ in range(8):  # retry for up to ~80s if not resolved yet
-                actual_winner = get_resolved_outcome(slug)
-                if actual_winner is not None:
-                    break
-                time.sleep(10)
-
-            if actual_winner is None:
-                log(f"[RESOLUTION] Could not confirm outcome for {slug} after retries — still unknown", crypto)
-                return
-
-            won = (actual_winner == side)
-            real_pnl = round((1.0 - buy_price) * shares, 4) if won else round(-buy_price * shares, 4)
-
-            with self.trades_lock:
-                self.pending -= 1
-                if won:
-                    self.wins += 1
-                else:
-                    self.losses += 1
-                self.realized_pnl += real_pnl
-
-            with _print_lock:
-                print(f"\n  RESOLUTION UPDATE " + "-" * 30)
-                print(f"  Market:    {slug}")
-                print(f"  Side held: {side.upper()}")
-                print(f"  Actual outcome: {actual_winner}")
-                print(f"  Result:    {'WON' if won else 'LOST'}")
-                print(f"  Real P&L:  {'+' if real_pnl >= 0 else ''}${real_pnl:.2f} (settled at ${'1.00' if won else '0.00'}/share)")
-                print("  " + "-" * 48)
-                print(flush=True)
-            self._print_session_tally()
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def _record(self, row: dict):
         with self.trades_lock:
             self.trades.append(row)
-            trade_num = len(self.trades)
-            if row["sell_result"] == "sold":
-                self.wins += 1
-                self.realized_pnl += row["pnl_usd"]
-            elif row["sell_result"] == "holding_to_resolution":
-                self.pending += 1
         self.logger.write(row)
-        self._print_trade_box(trade_num, row)
-
-        # Kick off a background check for the real market outcome. This
-        # works the same in --dry-run and --live — the market resolves for
-        # real regardless of whether our own position was real, and knowing
-        # what WOULD have happened is exactly the validation data dry-run
-        # exists for.
-        if row["sell_result"] == "holding_to_resolution":
-            self._resolve_pending(row["slug"], row["crypto"], row["signal_side"], row["buy_price"], row["buy_shares"])
-
-        self._print_session_tally()
+        pnl = row.get("pnl_usd", 0)
+        sign = "+" if isinstance(pnl, (int, float)) and pnl >= 0 else ""
+        log(f"RECORDED: side={row['signal_side']} | buy={row['buy_result']}@{row['buy_price']} | "
+            f"sell={row['sell_result']}@{row['sell_price']} | pnl={sign}${pnl}", row["crypto"])
 
     def _asset_loop(self, slug_prefix: str):
         crypto = MARKETS[slug_prefix]
