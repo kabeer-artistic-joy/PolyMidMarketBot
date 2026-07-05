@@ -52,6 +52,8 @@ load_dotenv()
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
+BINANCE_API = "https://api.binance.com"
+SYMBOLS = {"BTC": "BTCUSDT"}
 
 MARKETS = {
     "btc-updown-5m": "BTC",   # BTC only, per explicit request — extend later once validated
@@ -60,6 +62,10 @@ MARKETS = {
 SIGNAL_LOOKBACK_SEC   = 15    # how far back to look for recent momentum
 MIN_MOVE_TO_TRUST     = 0.03  # minimum real move (in price, not %) over the lookback before trusting direction —
                                 # a starting hypothesis, not a calibrated number. Prevents acting on pure noise.
+MAX_MOVE_TO_TRUST     = 0.15  # NEW — upper bound, calibrated directly from real data: the largest real winning
+                                # move observed was 0.13; the one large-move loss was 0.20. A move beyond this
+                                # ceiling is treated as possibly overextended/exhausted rather than more trustworthy.
+                                # Still a small-sample calibration (n=11 wins, 1 loss) — not a settled number.
 CLEANLINESS_MIN_RATIO = 0.5   # same concept as the predict-variant bot: net move vs total high-low range over
                                 # the lookback. A low ratio means whipsaw, not a real trend — same logic that
                                 # helped catch the delta bot's biggest-signal loss.
@@ -174,6 +180,48 @@ def mid_price(book: dict) -> float | None:
     return round((bid + ask) / 2, 4)
 
 
+def get_binance_price(symbol: str) -> float | None:
+    """Current price of the real underlying asset — used as an independent
+    check against Polymarket's own (sometimes noisy/lagging) derived price."""
+    try:
+        r = requests.get(f"{BINANCE_API}/api/v3/ticker/price", params={"symbol": symbol}, timeout=2)
+        r.raise_for_status()
+        return float(r.json()["price"])
+    except Exception:
+        return None
+
+
+class BinanceHistory:
+    """
+    Tracks the REAL underlying asset's price over the same lookback window
+    as PriceHistory, to independently confirm Polymarket's own signal isn't
+    just local noise/lag in Polymarket's derived price. A real move should
+    show up in both; a move that shows up ONLY in Polymarket's own price and
+    not in the real underlying asset is exactly the failure mode that caused
+    one of the two known losses this bot has had.
+    """
+    def __init__(self, lookback_sec: float):
+        self.lookback_sec = lookback_sec
+        self.buffer = collections.deque()
+
+    def add(self, price: float):
+        now = now_unix()
+        self.buffer.append((now, price))
+        cutoff = now - self.lookback_sec
+        while self.buffer and self.buffer[0][0] < cutoff:
+            self.buffer.popleft()
+
+    def direction(self) -> str | None:
+        """Returns 'Up', 'Down', or None if there's not enough data or the move is flat."""
+        if len(self.buffer) < 3:
+            return None
+        prices = [p for _, p in self.buffer]
+        move = prices[-1] - prices[0]
+        if move == 0:
+            return None
+        return "Up" if move > 0 else "Down"
+
+
 def next_window_start(now: float) -> int:
     return int((now // 300) + 1) * 300
 
@@ -221,6 +269,9 @@ class PriceHistory:
         if abs(move) < MIN_MOVE_TO_TRUST:
             result["reason"] = f"move {move:+.4f} < {MIN_MOVE_TO_TRUST} — too weak to trust"
             return result
+        if abs(move) > MAX_MOVE_TO_TRUST:
+            result["reason"] = f"move {move:+.4f} > {MAX_MOVE_TO_TRUST} — possibly overextended, treating as unreliable"
+            return result
         if cleanliness < CLEANLINESS_MIN_RATIO:
             result["reason"] = f"move {move:+.4f} OK, but cleanliness {cleanliness:.2f} < {CLEANLINESS_MIN_RATIO} — too much whipsaw"
             return result
@@ -234,7 +285,7 @@ class PriceHistory:
 
 CSV_FIELDS = [
     "timestamp", "bot_name", "mode", "crypto", "slug", "trade_num_this_window",
-    "signal_side", "signal_move", "signal_cleanliness", "signal_reason",
+    "signal_side", "signal_move", "signal_cleanliness", "signal_reason", "binance_agrees",
     "buy_result", "buy_price", "buy_shares", "buy_elapsed_ms",
     "sell_result", "sell_price", "pnl_usd", "notes",
 ]
@@ -516,8 +567,10 @@ class MomentumBot:
             log(f"Could not find market for window starting {start_ts} — skipping entire window", crypto)
             return
 
-        up_history   = PriceHistory(SIGNAL_LOOKBACK_SEC)
-        down_history = PriceHistory(SIGNAL_LOOKBACK_SEC)
+        up_history      = PriceHistory(SIGNAL_LOOKBACK_SEC)
+        down_history    = PriceHistory(SIGNAL_LOOKBACK_SEC)
+        binance_history = BinanceHistory(SIGNAL_LOOKBACK_SEC)
+        symbol = SYMBOLS.get(crypto)
         trades_this_window = 0
 
         while now_unix() < close_ts and trades_this_window < MAX_TRADES_PER_WINDOW:
@@ -530,6 +583,10 @@ class MomentumBot:
                 up_history.add(up_price)
             if down_price is not None:
                 down_history.add(down_price)
+            if symbol:
+                real_price = get_binance_price(symbol)
+                if real_price is not None:
+                    binance_history.add(real_price)
 
             up_signal   = up_history.signal()
             down_signal = down_history.signal()
@@ -543,6 +600,26 @@ class MomentumBot:
             elif down_signal["side"] == "Down":
                 chosen = ("Down", market["down_token"], down_price, down_signal)
 
+            # SHADOW-MODE ONLY: computed and logged on every signal, but never
+            # blocks an entry. Its one supporting example (a past trade this
+            # would have blocked) turned out to be a real win, not the loss
+            # it was built around — so this stays observation-only until
+            # there's enough real evidence to know if it's net helpful.
+            binance_agrees = None
+            if chosen:
+                side = chosen[0]
+                real_direction = binance_history.direction()
+                if real_direction is None:
+                    binance_agrees = "no_data"
+                    log(f"[SHADOW] Signal on {side}, Binance: not enough data yet to compare (not blocking)", crypto)
+                elif real_direction == side:
+                    binance_agrees = "agree"
+                    log(f"[SHADOW] Signal on {side}, Binance agrees ({real_direction}) — logged only", crypto)
+                else:
+                    binance_agrees = "disagree"
+                    log(f"[SHADOW] Signal on {side}, but Binance shows {real_direction} — DISAGREEMENT, "
+                        f"logged only, NOT blocking this entry", crypto)
+
             if chosen:
                 side, token, price, signal = chosen
                 trades_this_window += 1
@@ -553,7 +630,8 @@ class MomentumBot:
                     "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str,
                     "crypto": crypto, "slug": market["slug"], "trade_num_this_window": trades_this_window,
                     "signal_side": side, "signal_move": signal["move"], "signal_cleanliness": signal["cleanliness"],
-                    "signal_reason": signal["reason"], "buy_result": buy_info["result"],
+                    "signal_reason": signal["reason"], "binance_agrees": binance_agrees,
+                    "buy_result": buy_info["result"],
                     "buy_price": buy_info["price"], "buy_shares": buy_info["shares"],
                 }
 
