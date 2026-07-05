@@ -74,7 +74,9 @@ BUY_TIMEOUT_SEC     = 3.0
 MAX_TRADES_PER_WINDOW = 2
 
 MONITOR_INTERVAL = 2.0   # how often to check for a new entry opportunity throughout the window
-FORCE_EXIT_SECONDS_LEFT = 20  # shorter than the other bots' — entries here happen much later in the window already
+# Force-exit removed entirely per explicit request — unsold positions now ride
+# to actual market resolution instead of being sold early at a fixed cutoff.
+# This means an unsold trade can win fully or lose fully, not a bounded loss.
 
 POLL_INTERVAL_SLOW = 1.0
 
@@ -272,7 +274,7 @@ class MomentumBot:
         log("=" * 70)
         log(f"Momentum Scalper | {self.mode_str.upper()} | ${amount:.2f}/trade | bot_name={self.bot_name}")
         log(f"Signal: {SIGNAL_LOOKBACK_SEC}s lookback, min move {MIN_MOVE_TO_TRUST}, cleanliness >= {CLEANLINESS_MIN_RATIO}")
-        log(f"Sell trigger: entry + ${PROFIT_MARGIN} | force-exit last {FORCE_EXIT_SECONDS_LEFT}s | max {MAX_TRADES_PER_WINDOW} trades/window")
+        log(f"Sell trigger: entry + ${PROFIT_MARGIN} | unsold positions hold to actual resolution (no force-exit) | max {MAX_TRADES_PER_WINDOW} trades/window")
         log(f"Trade log: {self.logger.path}")
         log("=" * 70)
 
@@ -372,6 +374,10 @@ class MomentumBot:
         if shares != raw_shares:
             log(f"⚠️ Buy partially filled: held {raw_shares}, flooring to {shares} whole shares to keep sells valid", crypto)
         if shares < 1:
+            # NOTE: this specific case is NOT a premature time-based exit — a
+            # sub-1-share dust fill can never be sold as a normal limit order
+            # regardless of how much time is given, so exiting it immediately
+            # is the only option, not the thing that was removed below.
             log("⚠️ Partial fill left less than 1 whole share — forcing immediate exit", crypto)
             exit_result = self._force_exit(token, raw_shares, crypto)
             pnl = -round(buy_price * raw_shares, 4)
@@ -399,15 +405,22 @@ class MomentumBot:
                 sell_order_id = resp.get("orderID", "")
                 log(f"Resting SELL placed at ${sell_trigger}, order {sell_order_id[:16]}...", crypto)
             except Exception as e:
-                log(f"⚠️ Could not place resting sell ({e}) — forcing exit immediately", crypto)
+                # Order placement itself failing is a real error to recover
+                # from, not the time-based premature exit that was removed —
+                # keeping a fallback here is a different thing than force-exit.
+                log(f"⚠️ Could not place resting sell ({e}) — exiting immediately since we can't rest a sell at all", crypto)
                 exit_result = self._force_exit(token, shares, crypto)
                 pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
                 return {**exit_result, "pnl_usd": pnl, "notes": "resting sell placement failed"}
 
+            # No more time-based force-exit. Keep watching until either the
+            # resting order fully fills, or the window actually closes — at
+            # which point the position rides to real market resolution
+            # instead of being sold early. This means the true outcome of an
+            # unsold position is NOT known immediately anymore; it depends
+            # on the actual settlement, which this bot does not yet check.
             last_known_sold = 0.0
-            while True:
-                if close_ts - now_unix() <= FORCE_EXIT_SECONDS_LEFT:
-                    break
+            while now_unix() < close_ts:
                 try:
                     detail = self.client.get_order(sell_order_id)
                 except Exception:
@@ -427,23 +440,25 @@ class MomentumBot:
                 pnl = round((sell_trigger - buy_price) * shares, 4)
                 return {"result": "sold", "price": sell_trigger, "pnl_usd": pnl, "notes": "sold via resting order"}
 
+            remaining = round(shares - last_known_sold, 4)
+            # Cancel the now-stale resting sell BEFORE holding to resolution —
+            # otherwise it could still get matched at the old, low sell_trigger
+            # price right as the market resolves, accidentally giving away the
+            # exact upside this decision was meant to hold for. We keep the
+            # underlying shares; we just remove the order offering to sell them cheap.
             try:
                 self.client.cancel_order(OrderPayload(orderID=sell_order_id))
             except Exception:
-                pass
-            remaining = round(shares - last_known_sold, 4)
-            if remaining < 1:
-                pnl = round((sell_trigger - buy_price) * last_known_sold, 4)
-                return {"result": "sold", "price": sell_trigger, "pnl_usd": pnl, "notes": "dust remainder left"}
-            exit_result = self._force_exit(token, int(remaining), crypto)
-            sold_pnl = round((sell_trigger - buy_price) * last_known_sold, 4)
-            exit_pnl = round((exit_result["price"] - buy_price) * int(remaining), 4) if exit_result["price"] is not None else -round(buy_price * int(remaining), 4)
-            return {**exit_result, "pnl_usd": round(sold_pnl + exit_pnl, 4), "notes": "partial via resting order + force-exit"}
+                pass  # may already be gone if it just fully filled in the final instant — fine
+            log(f"⏰ Window closed with {remaining} shares unsold — cancelled the resting sell, holding to actual "
+                f"market resolution, true outcome not yet known", crypto)
+            sold_pnl = round((sell_trigger - buy_price) * last_known_sold, 4) if last_known_sold > 0 else 0.0
+            return {"result": "holding_to_resolution", "price": None, "pnl_usd": sold_pnl,
+                    "notes": f"{remaining} shares still unsold at window close — pnl on those is pending actual resolution, not reflected above"}
 
-        # DRY-RUN: poll-based simulation
-        while True:
-            if close_ts - now_unix() <= FORCE_EXIT_SECONDS_LEFT:
-                break
+        # DRY-RUN: poll-based simulation. Same change — keep watching until
+        # sold or the window closes, no simulated forced exit.
+        while now_unix() < close_ts:
             book = get_order_book(token)
             price, size = best_bid(book)
             if price is not None and price >= sell_trigger and size >= shares:
@@ -452,10 +467,9 @@ class MomentumBot:
                 return {"result": "sold", "price": price, "pnl_usd": pnl, "notes": "sold"}
             time.sleep(POLL_INTERVAL_SLOW)
 
-        log(f"⏰ Force-exit window reached, still holding — exiting at best price", crypto)
-        exit_result = self._force_exit(token, shares, crypto)
-        pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-        return {**exit_result, "pnl_usd": pnl, "notes": "force-exit"}
+        log(f"⏰ Window closed, still holding — this would ride to actual resolution (not simulated here)", crypto)
+        return {"result": "holding_to_resolution", "price": None, "pnl_usd": 0.0,
+                "notes": "never reached sell trigger before window close — true outcome not simulated"}
 
     def _force_exit(self, token: str, shares: float, crypto: str) -> dict:
         if self.dry_run:
@@ -506,7 +520,7 @@ class MomentumBot:
         down_history = PriceHistory(SIGNAL_LOOKBACK_SEC)
         trades_this_window = 0
 
-        while now_unix() < close_ts - FORCE_EXIT_SECONDS_LEFT and trades_this_window < MAX_TRADES_PER_WINDOW:
+        while now_unix() < close_ts and trades_this_window < MAX_TRADES_PER_WINDOW:
             if self.stop_event.is_set():
                 return
 
@@ -597,14 +611,18 @@ class MomentumBot:
         log("-" * 70)
         with self.trades_lock:
             trades = list(self.trades)
-        bought = [t for t in trades if t["buy_result"] == "bought"]
-        sold   = [t for t in bought if t["sell_result"] == "sold"]
-        forced = [t for t in bought if t["sell_result"] in ("exited", "no_bids", "unmatched")]
+        bought  = [t for t in trades if t["buy_result"] == "bought"]
+        sold    = [t for t in bought if t["sell_result"] == "sold"]
+        pending = [t for t in bought if t["sell_result"] == "holding_to_resolution"]
+        dust    = [t for t in bought if t["sell_result"] not in ("sold", "holding_to_resolution")]
         total_pnl = sum(float(t["pnl_usd"] or 0) for t in trades)
         log(f"SUMMARY — {len(trades)} signals fired, {len(bought)} buy fills")
         log(f"  Sold at margin: {len(sold)}")
-        log(f"  Force-exited: {len(forced)}")
-        log(f"  Total PnL: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
+        log(f"  Holding to actual resolution (outcome not yet known): {len(pending)}")
+        if dust:
+            log(f"  Other (dust/error handling): {len(dust)}")
+        log(f"  Total PnL shown here EXCLUDES pending positions — check your actual account for their real outcome")
+        log(f"  Realized PnL so far: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
         log("-" * 70)
 
 
