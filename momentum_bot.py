@@ -324,7 +324,10 @@ class MomentumBot:
         log("=" * 70)
         log(f"Momentum Scalper | {self.mode_str.upper()} | ${amount:.2f}/trade | bot_name={self.bot_name}")
         log(f"Signal: {SIGNAL_LOOKBACK_SEC}s lookback, min move {MIN_MOVE_TO_TRUST}, max move {MAX_MOVE_TO_TRUST}, cleanliness >= {CLEANLINESS_MIN_RATIO}")
-        log(f"Sell trigger: entry + ${PROFIT_MARGIN} | force-exit last {FORCE_EXIT_SECONDS_LEFT}s | max {MAX_TRADES_PER_WINDOW} trades/window")
+        log(f"Direction: price-to-beat delta (not local wiggle) | local signal only gates WHEN to act")
+        log(f"Sell trigger: entry + ${PROFIT_MARGIN} | primary exit cap: {TRADE_AGE_CAP_SECONDS}s from buy | "
+            f"backstop: {FORCE_EXIT_SECONDS_LEFT}s before window close | max {MAX_TRADES_PER_WINDOW} trades/window")
+        log(f"Testing candidate caps (dry-run only): {CANDIDATE_CAPS_TO_TEST}")
         log(f"Trade log: {self.logger.path}")
         log("=" * 70)
 
