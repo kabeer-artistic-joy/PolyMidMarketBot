@@ -60,6 +60,11 @@ MARKETS = {
 SIGNAL_LOOKBACK_SEC   = 15    # how far back to look for recent momentum
 MIN_MOVE_TO_TRUST     = 0.03  # minimum real move (in price, not %) over the lookback before trusting direction —
                                 # a starting hypothesis, not a calibrated number. Prevents acting on pure noise.
+MIN_DELTA_PCT_TO_TRUST = 0.01  # REAL BUG FIXED: a delta as small as $0.01 on a $63,000+ asset (0.000016%) was
+                                # being trusted with full confidence to override the local signal — that's pure
+                                # noise, not a real "BTC is above/below price-to-beat" signal. Requires the delta
+                                # to clear this % threshold before trusting its sign; below it, falls back to the
+                                # local signal instead of flipping direction on a coin-flip-level difference.
 MAX_MOVE_TO_TRUST     = 0.15  # upper bound, calibrated from real data: the largest real winning move observed
                                 # was 0.13; the one known large-move loss was 0.20. A move beyond this ceiling
                                 # is treated as possibly overextended/exhausted rather than more trustworthy.
@@ -642,18 +647,27 @@ class MomentumBot:
 
             chosen = None
             if local_trigger_side is not None:
-                delta_side, delta_value = None, None
+                delta_side, delta_value, delta_pct = None, None, None
                 if symbol and window_open_price:
                     current_btc_price = get_binance_price(symbol)
                     if current_btc_price is not None:
                         delta_value = current_btc_price - window_open_price
+                        delta_pct = abs(delta_value) / window_open_price * 100
                         delta_side = "Up" if delta_value > 0 else "Down"
 
-                if delta_side is not None:
+                if delta_side is not None and delta_pct >= MIN_DELTA_PCT_TO_TRUST:
                     final_side = delta_side
                     if delta_side != local_trigger_side:
                         log(f"Local wiggle said {local_trigger_side}, but BTC is actually "
-                            f"{delta_value:+.2f} from price-to-beat -> betting {delta_side} instead", crypto)
+                            f"{delta_value:+.2f} ({delta_pct:.4f}%) from price-to-beat -> betting {delta_side} instead", crypto)
+                elif delta_side is not None:
+                    # Delta is too small to be a real signal (e.g. a few cents on
+                    # a $60k+ asset) — trusting its sign here would be acting on
+                    # noise, exactly the bug that caused a real loss. Fall back
+                    # to the local signal instead of flipping on a coin-flip-level
+                    # difference.
+                    final_side = local_trigger_side
+                    log(f"Delta {delta_value:+.2f} ({delta_pct:.4f}%) too small to trust — using local signal ({local_trigger_side})", crypto)
                 else:
                     # Couldn't fetch price-to-beat data this cycle — fall back
                     # to the local signal rather than skip the trade entirely.
@@ -662,9 +676,14 @@ class MomentumBot:
 
                 price = up_price if final_side == "Up" else down_price
                 token = market["up_token"] if final_side == "Up" else market["down_token"]
-                signal = up_signal if final_side == "Up" else down_signal
+                # REAL BUG FIXED: this used to log final_side's signal object,
+                # which could show a FAILING reason (e.g. "too weak to trust")
+                # even though the trade was genuinely triggered by the OTHER
+                # side's signal passing its own check. Log the signal that
+                # actually fired, not the side we ended up betting on.
+                triggering_signal = up_signal if local_trigger_side == "Up" else down_signal
                 if price is not None:
-                    chosen = (final_side, token, price, signal)
+                    chosen = (final_side, token, price, triggering_signal)
 
             if chosen:
                 side, token, price, signal = chosen
