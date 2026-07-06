@@ -75,7 +75,19 @@ BUY_TIMEOUT_SEC     = 3.0
 MAX_TRADES_PER_WINDOW = 2
 
 MONITOR_INTERVAL = 2.0   # how often to check for a new entry opportunity throughout the window
-FORCE_EXIT_SECONDS_LEFT = 5  # exit at any price if still holding with this little time left in the window
+FORCE_EXIT_SECONDS_LEFT = 60  # ULTIMATE BACKSTOP ONLY now — kept in case a signal fires so late in
+                                # the window that even the trade-age cap below wouldn't fit before close.
+                                # The PRIMARY exit decision is now TRADE_AGE_CAP_SECONDS, not this.
+
+TRADE_AGE_CAP_SECONDS = 20     # PRIMARY exit rule: if not sold within this many seconds of BUYING
+                                # (not window close), exit at whatever price is available. Chosen from
+                                # real data: ~50% of real wins resolve within 20s of entry. This is a
+                                # deliberate trade-off — some trades that would have won after 1-2 more
+                                # minutes will now be cut short — being tested with real dry-run data,
+                                # not assumed to be correct.
+CANDIDATE_CAPS_TO_TEST = [10, 15, 20, 25, 30, 40]  # DRY-RUN ONLY: every one of these is evaluated from
+                                # the SAME continuously-recorded price history, so we can compare them
+                                # side by side on real data before picking one for real use.
 
 POLL_INTERVAL_SLOW = 1.0
 
@@ -239,6 +251,7 @@ CSV_FIELDS = [
     "signal_side", "signal_move", "signal_cleanliness", "signal_reason",
     "buy_result", "buy_price", "buy_shares", "buy_elapsed_ms",
     "sell_result", "sell_price", "pnl_usd", "notes",
+    "cap_10s_pnl", "cap_15s_pnl", "cap_20s_pnl", "cap_25s_pnl", "cap_30s_pnl", "cap_40s_pnl",
 ]
 
 class TradeLogger:
@@ -408,8 +421,9 @@ class MomentumBot:
                 pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
                 return {**exit_result, "pnl_usd": pnl, "notes": "resting sell placement failed"}
 
+            buy_time = now_unix()
             last_known_sold = 0.0
-            while close_ts - now_unix() > FORCE_EXIT_SECONDS_LEFT:
+            while (now_unix() - buy_time < TRADE_AGE_CAP_SECONDS) and (close_ts - now_unix() > FORCE_EXIT_SECONDS_LEFT):
                 try:
                     detail = self.client.get_order(sell_order_id)
                 except Exception:
@@ -442,20 +456,54 @@ class MomentumBot:
             exit_pnl = round((exit_result["price"] - buy_price) * int(remaining), 4) if exit_result["price"] is not None else -round(buy_price * int(remaining), 4)
             return {**exit_result, "pnl_usd": round(sold_pnl + exit_pnl, 4), "notes": "partial via resting order + force-exit"}
 
-        # DRY-RUN: poll-based simulation
-        while close_ts - now_unix() > FORCE_EXIT_SECONDS_LEFT:
+        # DRY-RUN: record ONE continuous price history from buy time onward,
+        # up to the largest candidate cap (or window close, whichever is
+        # sooner) — then evaluate every candidate cap from that SAME
+        # recording, so they're directly comparable on identical data
+        # instead of separate, slightly-different observation windows.
+        buy_time = now_unix()
+        max_cap = max(CANDIDATE_CAPS_TO_TEST)
+        price_history = []  # (elapsed_seconds, bid_price, bid_size)
+
+        while True:
+            elapsed = now_unix() - buy_time
+            if elapsed > max_cap or close_ts - now_unix() <= 0:
+                break
             book = get_order_book(token)
             price, size = best_bid(book)
-            if price is not None and price >= sell_trigger and size >= shares:
-                log(f"[DRY] SELL would fill: bid ${price:.3f}", crypto)
-                pnl = round((price - buy_price) * shares, 4)
-                return {"result": "sold", "price": price, "pnl_usd": pnl, "notes": "sold"}
+            if price is not None:
+                price_history.append((elapsed, price, size))
             time.sleep(POLL_INTERVAL_SLOW)
 
-        log(f"⏰ Force-exit window reached ({FORCE_EXIT_SECONDS_LEFT}s left), still holding — exiting at best price", crypto)
-        exit_result = self._force_exit(token, shares, crypto)
-        pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-        return {**exit_result, "pnl_usd": pnl, "notes": "force-exit"}
+        def evaluate_cap(cap_seconds: float) -> dict:
+            """Replays the SAME recorded history to see what this specific
+            cap value would have done — sold if the trigger was hit at or
+            before the cap, otherwise exited at whatever price was last
+            available at or before the cap."""
+            hit = next(((e, p) for e, p, s in price_history
+                        if e <= cap_seconds and p >= sell_trigger and s >= shares), None)
+            if hit:
+                _, hit_price = hit
+                return {"result": "sold", "price": hit_price, "pnl": round((hit_price - buy_price) * shares, 4)}
+            before_cap = [p for e, p, s in price_history if e <= cap_seconds]
+            if before_cap:
+                exit_price = before_cap[-1]
+                return {"result": "capped_exit", "price": exit_price, "pnl": round((exit_price - buy_price) * shares, 4)}
+            return {"result": "no_bids", "price": None, "pnl": -round(buy_price * shares, 4)}
+
+        candidate_results = {cap: evaluate_cap(cap) for cap in CANDIDATE_CAPS_TO_TEST}
+        primary = candidate_results[TRADE_AGE_CAP_SECONDS]
+
+        log(f"[DRY] Primary (cap={TRADE_AGE_CAP_SECONDS}s): {primary['result']} @ "
+            f"{'$'+format(primary['price'],'.3f') if primary['price'] is not None else 'no bids'} | pnl={primary['pnl']:+.2f}", crypto)
+        cap_summary = " | ".join(f"{c}s:{candidate_results[c]['pnl']:+.2f}" for c in CANDIDATE_CAPS_TO_TEST)
+        log(f"[DRY] Candidate caps comparison — {cap_summary}", crypto)
+
+        return {
+            "result": primary["result"], "price": primary["price"], "pnl_usd": primary["pnl"],
+            "notes": f"primary cap={TRADE_AGE_CAP_SECONDS}s",
+            "candidate_pnls": {c: candidate_results[c]["pnl"] for c in CANDIDATE_CAPS_TO_TEST},
+        }
 
     def _force_exit(self, token: str, shares: float, crypto: str) -> dict:
         if self.dry_run:
@@ -507,7 +555,7 @@ class MomentumBot:
         down_history = PriceHistory(SIGNAL_LOOKBACK_SEC)
         trades_this_window = 0
 
-        while now_unix() < close_ts and trades_this_window < MAX_TRADES_PER_WINDOW:
+        while now_unix() < close_ts - FORCE_EXIT_SECONDS_LEFT and trades_this_window < MAX_TRADES_PER_WINDOW:
             if self.stop_event.is_set():
                 return
 
@@ -522,9 +570,14 @@ class MomentumBot:
             down_signal = down_history.signal()
 
             chosen = None
-            if up_signal["side"] == "Up":
+            # REAL BUG FIXED HERE: mid_price() can return None if the book is
+            # missing a bid or ask side entirely — confirmed from real crash
+            # logs happening right after a force-exit, when the book briefly
+            # has nothing on one side. That None was flowing straight into
+            # _attempt_buy() and crashing on `price + BUY_CEILING_BUFFER`.
+            if up_signal["side"] == "Up" and up_price is not None:
                 chosen = ("Up", market["up_token"], up_price, up_signal)
-            elif down_signal["side"] == "Down":
+            elif down_signal["side"] == "Down" and down_price is not None:
                 chosen = ("Down", market["down_token"], down_price, down_signal)
 
             if chosen:
@@ -551,6 +604,9 @@ class MomentumBot:
                     "sell_result": sell_info["result"], "sell_price": sell_info["price"],
                     "pnl_usd": sell_info["pnl_usd"], "notes": sell_info["notes"],
                 })
+                if "candidate_pnls" in sell_info:
+                    for cap, pnl in sell_info["candidate_pnls"].items():
+                        row[f"cap_{cap}s_pnl"] = pnl
                 self._record(row)
 
             time.sleep(MONITOR_INTERVAL)
