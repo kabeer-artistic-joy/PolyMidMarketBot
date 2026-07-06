@@ -50,6 +50,8 @@ load_dotenv()
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
+BINANCE_API = "https://api.binance.com"
+SYMBOLS = {"BTC": "BTCUSDT"}
 
 MARKETS = {
     "btc-updown-5m": "BTC",   # BTC only, per explicit request — extend later once validated
@@ -79,7 +81,7 @@ FORCE_EXIT_SECONDS_LEFT = 60  # ULTIMATE BACKSTOP ONLY now — kept in case a si
                                 # the window that even the trade-age cap below wouldn't fit before close.
                                 # The PRIMARY exit decision is now TRADE_AGE_CAP_SECONDS, not this.
 
-TRADE_AGE_CAP_SECONDS = 20     # PRIMARY exit rule: if not sold within this many seconds of BUYING
+TRADE_AGE_CAP_SECONDS = 30     # PRIMARY exit rule: if not sold within this many seconds of BUYING
                                 # (not window close), exit at whatever price is available. Chosen from
                                 # real data: ~50% of real wins resolve within 20s of entry. This is a
                                 # deliberate trade-off — some trades that would have won after 1-2 more
@@ -183,6 +185,39 @@ def mid_price(book: dict) -> float | None:
     if bid is None or ask is None:
         return None
     return round((bid + ask) / 2, 4)
+
+
+def get_window_open_price(symbol: str, window_ts: int) -> float | None:
+    """
+    Fetches the REAL 'price to beat' — the price of the underlying asset at
+    the moment THIS window opened. This is the missing piece that let the
+    bot get fooled by local noise: without this, it only ever saw "did the
+    price wiggle up or down in the last 15 seconds," with no idea whether
+    that wiggle was a genuine reversal of the window's overall direction or
+    just a small blip within a much larger move the other way.
+    """
+    try:
+        r = requests.get(
+            f"{BINANCE_API}/api/v3/klines",
+            params={"symbol": symbol, "interval": "5m", "startTime": window_ts * 1000, "limit": 1},
+            timeout=3,
+        )
+        r.raise_for_status()
+        candles = r.json()
+        if candles:
+            return float(candles[0][1])
+        return None
+    except Exception:
+        return None
+
+
+def get_binance_price(symbol: str) -> float | None:
+    try:
+        r = requests.get(f"{BINANCE_API}/api/v3/ticker/price", params={"symbol": symbol}, timeout=2)
+        r.raise_for_status()
+        return float(r.json()["price"])
+    except Exception:
+        return None
 
 
 def next_window_start(now: float) -> int:
@@ -464,6 +499,7 @@ class MomentumBot:
         buy_time = now_unix()
         max_cap = max(CANDIDATE_CAPS_TO_TEST)
         price_history = []  # (elapsed_seconds, bid_price, bid_size)
+        trigger_logged = [False]  # mutable flag so the loop below can set it once
 
         while True:
             elapsed = now_unix() - buy_time
@@ -473,6 +509,15 @@ class MomentumBot:
             price, size = best_bid(book)
             if price is not None:
                 price_history.append((elapsed, price, size))
+                # REAL-TIME visibility fix: log the moment the trigger is
+                # actually crossed, instead of only finding out about it
+                # retroactively once the full recording period ends. This was
+                # the exact thing that looked like "the bot always waits the
+                # full duration" — the math was already correct, but nothing
+                # was printed until everything finished.
+                if price >= sell_trigger and size >= shares and not trigger_logged[0]:
+                    log(f"[DRY] Sell trigger REACHED at {elapsed:.0f}s: bid ${price:.3f} >= ${sell_trigger}", crypto)
+                    trigger_logged[0] = True
             time.sleep(POLL_INTERVAL_SLOW)
 
         def evaluate_cap(cap_seconds: float) -> dict:
@@ -555,6 +600,13 @@ class MomentumBot:
         down_history = PriceHistory(SIGNAL_LOOKBACK_SEC)
         trades_this_window = 0
 
+        symbol = SYMBOLS.get(crypto)
+        window_open_price = get_window_open_price(symbol, start_ts) if symbol else None
+        if window_open_price:
+            log(f"Price to beat this window: ${window_open_price:,.2f}", crypto)
+        else:
+            log(f"Could not fetch price-to-beat — will fall back to local momentum direction if needed", crypto)
+
         while now_unix() < close_ts - FORCE_EXIT_SECONDS_LEFT and trades_this_window < MAX_TRADES_PER_WINDOW:
             if self.stop_event.is_set():
                 return
@@ -569,16 +621,47 @@ class MomentumBot:
             up_signal   = up_history.signal()
             down_signal = down_history.signal()
 
-            chosen = None
-            # REAL BUG FIXED HERE: mid_price() can return None if the book is
-            # missing a bid or ask side entirely — confirmed from real crash
-            # logs happening right after a force-exit, when the book briefly
-            # has nothing on one side. That None was flowing straight into
-            # _attempt_buy() and crashing on `price + BUY_CEILING_BUFFER`.
+            # THE CORE FIX: the trigger for "is something real happening right
+            # now, worth acting on" stays EXACTLY the same as before (local
+            # momentum + cleanliness on Polymarket's own price) — this does
+            # NOT reduce how often the bot trades. What changes is WHICH SIDE
+            # gets bet on: instead of just following the local wiggle's own
+            # direction (which could be a small uptick within a much larger,
+            # established downtrend), we bet on where BTC actually sits
+            # relative to this window's price-to-beat right now. A local
+            # uptick while still well below price-to-beat is noise, not a
+            # reason to bet Up.
+            local_trigger_side = None
             if up_signal["side"] == "Up" and up_price is not None:
-                chosen = ("Up", market["up_token"], up_price, up_signal)
+                local_trigger_side = "Up"
             elif down_signal["side"] == "Down" and down_price is not None:
-                chosen = ("Down", market["down_token"], down_price, down_signal)
+                local_trigger_side = "Down"
+
+            chosen = None
+            if local_trigger_side is not None:
+                delta_side, delta_value = None, None
+                if symbol and window_open_price:
+                    current_btc_price = get_binance_price(symbol)
+                    if current_btc_price is not None:
+                        delta_value = current_btc_price - window_open_price
+                        delta_side = "Up" if delta_value > 0 else "Down"
+
+                if delta_side is not None:
+                    final_side = delta_side
+                    if delta_side != local_trigger_side:
+                        log(f"Local wiggle said {local_trigger_side}, but BTC is actually "
+                            f"{delta_value:+.2f} from price-to-beat -> betting {delta_side} instead", crypto)
+                else:
+                    # Couldn't fetch price-to-beat data this cycle — fall back
+                    # to the local signal rather than skip the trade entirely.
+                    final_side = local_trigger_side
+                    log("Could not confirm delta from price-to-beat this cycle — using local signal as fallback", crypto)
+
+                price = up_price if final_side == "Up" else down_price
+                token = market["up_token"] if final_side == "Up" else market["down_token"]
+                signal = up_signal if final_side == "Up" else down_signal
+                if price is not None:
+                    chosen = (final_side, token, price, signal)
 
             if chosen:
                 side, token, price, signal = chosen
